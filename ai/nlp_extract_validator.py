@@ -1,0 +1,85 @@
+import os
+import json
+from .nlp_rule_rag import RuleRAG
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+rule_path = os.path.join(base_dir, "rule_doc.txt")
+rag = RuleRAG(rule_file_path=rule_path)
+
+
+class RuleExtractorValidator:
+    def __init__(self):
+        pass
+
+    def extract_action(self, llm_raw_text: str):
+        """【信息抽取】从LLM返回文本中抽取动作实体：skill, target, speech
+        优先解析JSON；如果LLM夹带多余文字，简单清洗后抽取
+        """
+        try:
+            # 尝试直接加载json
+            data = json.loads(llm_raw_text)
+            speech = data.get("speech", "")
+            action = data.get("action", {})
+            skill = action.get("skill", None)
+            target = action.get("target", None)
+            return {
+                "success": True,
+                "speech": speech,
+                "skill": skill,
+                "target": target
+            }
+        except json.JSONDecodeError:
+            # 兜底：简单正则抽取（简易信息抽取，可选，不想复杂可以去掉）
+            import re
+            skill_match = re.search(r'"skill"\s*:\s*"([a-zA-Z0-9_]+)"', llm_raw_text)
+            target_match = re.search(r'"target"\s*:\s*(\d+)', llm_raw_text)
+            speech_match = re.search(r'"speech"\s*:\s*"([^"]+)"', llm_raw_text)
+            skill = skill_match.group(1) if skill_match else None
+            target = int(target_match.group(1)) if target_match else None
+            speech = speech_match.group(1) if speech_match else ""
+            if skill is not None and target is not None:
+                return {
+                    "success": True,
+                    "speech": speech,
+                    "skill": skill,
+                    "target": target
+                }
+            else:
+                return {"success": False, "msg": "无法抽取技能、目标实体，格式错误"}
+
+    def validate_by_rule(self, extracted, player, game_state, assigned_skill):
+        """
+        基于抽取结果 + RAG检索原始规则，做语义校验
+        :param extracted: extract_action返回的抽取结果
+        :param player: 当前玩家对象
+        :param game_state: 游戏状态
+        :param assigned_skill: 系统本回合分配给该玩家的技能（强制约束）
+        :return: (is_ok, msg)
+        """
+        if not extracted["success"]:
+            return False, extracted["msg"]
+
+        skill = extracted["skill"]
+        target = extracted["target"]
+        identity = player.identity.value
+        alive_ids = [p.player_id for p in game_state.players if p.is_alive]
+
+        # 校验1：技能必须是系统分配的技能（最高优先级）
+        if skill != assigned_skill:
+            return False, f"规则校验失败：私自更换技能，本回合只能使用 {assigned_skill}"
+
+        # 校验2：目标合法性
+        if target == player.player_id:
+            return False, "规则校验失败：不能选择自己作为目标"
+        if target not in alive_ids:
+            return False, f"规则校验失败：目标玩家{target}已经死亡，不合法"
+
+        # 校验3：调用RAG检索规则文档，核对【该身份是否有权限使用这个技能】（NLP语义匹配）
+        query = f"身份{identity} 是否可以使用技能 {skill}，使用权限要求是什么"
+        rule_text = rag.retrieve_rule(query, top_k=2)
+        # 简单关键词语义判断（如果你规则文档写的标准，效果很好；进阶可以用相似度打分）
+        deny_key = ["禁止", "不能", "仅允许", "只允许"]
+        # 这里是语义核对：检索到的规则如果写了仅XXX可用，做判断
+        if f"仅允许{identity}" not in rule_text and "仅允许" in rule_text:
+            return False, f"规则文档校验不通过：{identity} 没有 {skill} 的使用权限，检索到规则：{rule_text[:200]}"
+
+        return True, "NLP规则抽取校验通过"
